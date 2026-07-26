@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elouan Martinet <exa@elou.world>
+Date: Sun, 26 Jul 2026 17:41:52 +0000
+Subject: [PATCH] fix: restore endgame block requests
+
+Since 4.1.0 (#7027) the wishlist hands each block to at most one peer and
+only returns it to the pool on choke / reject / cancel / disconnect. At the
+tail of a download that lets a single slow or unresponsive peer hold the
+last blocks hostage while every other peer sits idle -- the "stuck at
+99.9%" reports in transmission#7834, #7919 and #8935.
+
+Restore the 3.00/4.0.x endgame policy: once we have as many bytes of block
+requests in flight as we still need, let a second peer race for the blocks
+that are already in flight. The swarm-side machinery for this was never
+removed -- tr_swarm::cancel_all_requests_for_block() already cancels the
+losing requests as soon as the block lands.
+---
+ libtransmission/peer-mgr-wishlist.cc          | 68 +++++++++++++++++--
+ libtransmission/peer-mgr-wishlist.h           | 15 +++-
+ libtransmission/peer-mgr.cc                   | 22 +++++-
+ .../libtransmission/peer-mgr-wishlist-test.cc | 62 +++++++++++++++++
+ 4 files changed, 158 insertions(+), 9 deletions(-)
+
+diff --git a/libtransmission/peer-mgr-wishlist.cc b/libtransmission/peer-mgr-wishlist.cc
+index 5cb5732ad..dc22482ef 100644
+--- a/libtransmission/peer-mgr-wishlist.cc
++++ b/libtransmission/peer-mgr-wishlist.cc
+@@ -110,7 +110,8 @@ public:
+ 
+     [[nodiscard]] std::vector<tr_block_span_t> next(
+         size_t n_wanted_blocks,
+-        std::function<bool(tr_piece_index_t)> const& peer_has_piece);
++        std::function<bool(tr_piece_index_t)> const& peer_has_piece,
++        std::function<bool(tr_block_index_t)> const& peer_has_active_request);
+ 
+ private:
+     TR_CONSTEXPR20 void dec_replication() noexcept
+@@ -574,7 +575,8 @@ Wishlist::Impl::Impl(Mediator& mediator_in)
+ 
+ std::vector<tr_block_span_t> Wishlist::Impl::next(
+     size_t const n_wanted_blocks,
+-    std::function<bool(tr_piece_index_t)> const& peer_has_piece)
++    std::function<bool(tr_piece_index_t)> const& peer_has_piece,
++    std::function<bool(tr_block_index_t)> const& peer_has_active_request)
+ {
+     if (n_wanted_blocks == 0U)
+     {
+@@ -605,9 +607,62 @@ std::vector<tr_block_span_t> Wishlist::Impl::next(
+         std::copy_n(std::rbegin(candidate.unrequested), n_to_add, std::back_inserter(blocks));
+     }
+ 
+-    // Ensure the list of blocks are sorted
+-    // The list needs to be unique as well, but that should come naturally
++    // Endgame.
++    //
++    // Outside of endgame the wishlist hands each block to a single peer, and a
++    // block only returns to the pool on choke / reject / cancel / disconnect.
++    // At the tail of a download that lets one slow or unresponsive peer hold
++    // the last blocks hostage while every other peer sits idle -- the classic
++    // "stuck at 99.9%" symptom.
++    //
++    // So once everything we still want is already in flight, let a second peer
++    // race for those blocks, the way 3.00 and 4.0.x did. When the block finally
++    // lands, tr_swarm::cancel_all_requests_for_block() cancels the losers.
++    if (std::size(blocks) < n_wanted_blocks && mediator_.is_endgame())
++    {
++        for (auto const& candidate : candidates_)
++        {
++            if (std::size(blocks) >= n_wanted_blocks)
++            {
++                break;
++            }
++
++            if (candidate.replication == 0 || !peer_has_piece(candidate.piece))
++            {
++                continue;
++            }
++
++            for (auto [block, end] = candidate.block_span; block < end && std::size(blocks) < n_wanted_blocks; ++block)
++            {
++                // not in flight: either already offered by the loop above, or
++                // it is not ours to hand out twice
++                if (candidate.unrequested.contains(block))
++                {
++                    continue;
++                }
++
++                // we already have it, it just hasn't been checksummed yet
++                if (mediator_.client_has_block(block))
++                {
++                    continue;
++                }
++
++                // no point asking the same peer twice
++                if (peer_has_active_request && peer_has_active_request(block))
++                {
++                    continue;
++                }
++
++                blocks.push_back(block);
++            }
++        }
++    }
++
++    // Ensure the list of blocks is sorted and unique. Uniqueness comes
++    // naturally from the first loop, but the endgame loop above walks whole
++    // block spans, so be explicit about it.
+     std::sort(std::begin(blocks), std::end(blocks));
++    blocks.erase(std::unique(std::begin(blocks), std::end(blocks)), std::end(blocks));
+     return make_spans(blocks);
+ }
+ 
+@@ -645,7 +700,8 @@ Wishlist::~Wishlist() = default;
+ 
+ std::vector<tr_block_span_t> Wishlist::next(
+     size_t const n_wanted_blocks,
+-    std::function<bool(tr_piece_index_t)> const& peer_has_piece)
++    std::function<bool(tr_piece_index_t)> const& peer_has_piece,
++    std::function<bool(tr_block_index_t)> const& peer_has_active_request)
+ {
+-    return impl_->next(n_wanted_blocks, peer_has_piece);
++    return impl_->next(n_wanted_blocks, peer_has_piece, peer_has_active_request);
+ }
+diff --git a/libtransmission/peer-mgr-wishlist.h b/libtransmission/peer-mgr-wishlist.h
+index ae2f5fbf4..9b79987d1 100644
+--- a/libtransmission/peer-mgr-wishlist.h
++++ b/libtransmission/peer-mgr-wishlist.h
+@@ -33,6 +33,12 @@ public:
+         [[nodiscard]] virtual bool client_has_block(tr_block_index_t block) const = 0;
+         [[nodiscard]] virtual bool client_has_piece(tr_piece_index_t piece) const = 0;
+         [[nodiscard]] virtual bool client_wants_piece(tr_piece_index_t piece) const = 0;
++
++        // True when we have as many bytes of block requests in flight as we
++        // still need to finish the torrent, i.e. every block we still want has
++        // already been asked of somebody. See Wishlist::Impl::next().
++        [[nodiscard]] virtual bool is_endgame() const = 0;
++
+         [[nodiscard]] virtual bool is_sequential_download() const = 0;
+         [[nodiscard]] virtual tr_piece_index_t sequential_download_from_piece() const = 0;
+         [[nodiscard]] virtual size_t count_piece_replication(tr_piece_index_t piece) const = 0;
+@@ -78,10 +84,15 @@ public:
+     explicit Wishlist(Mediator& mediator_in);
+     ~Wishlist();
+ 
+-    // the next blocks that we should request from a peer
++    // the next blocks that we should request from a peer.
++    //
++    // `peer_has_active_request` tells the wishlist which blocks the peer is
++    // already downloading. It is only consulted during endgame, when a block
++    // may be requested from more than one peer at a time.
+     [[nodiscard]] std::vector<tr_block_span_t> next(
+         size_t n_wanted_blocks,
+-        std::function<bool(tr_piece_index_t)> const& peer_has_piece);
++        std::function<bool(tr_piece_index_t)> const& peer_has_piece,
++        std::function<bool(tr_block_index_t)> const& peer_has_active_request = {});
+ 
+ private:
+     class Impl;
+diff --git a/libtransmission/peer-mgr.cc b/libtransmission/peer-mgr.cc
+index 0aa4f8f7c..6dd348a32 100644
+--- a/libtransmission/peer-mgr.cc
++++ b/libtransmission/peer-mgr.cc
+@@ -382,6 +382,7 @@ public:
+         [[nodiscard]] bool client_has_block(tr_block_index_t block) const override;
+         [[nodiscard]] bool client_has_piece(tr_piece_index_t piece) const override;
+         [[nodiscard]] bool client_wants_piece(tr_piece_index_t piece) const override;
++        [[nodiscard]] bool is_endgame() const override;
+         [[nodiscard]] bool is_sequential_download() const override;
+         [[nodiscard]] tr_piece_index_t sequential_download_from_piece() const override;
+         [[nodiscard]] size_t count_piece_replication(tr_piece_index_t piece) const override;
+@@ -1018,6 +1019,22 @@ bool tr_swarm::WishlistMediator::client_wants_piece(tr_piece_index_t piece) cons
+     return tor_.piece_is_wanted(piece);
+ }
+ 
++bool tr_swarm::WishlistMediator::is_endgame() const
++{
++    // We consider ourselves to be in endgame if the number of bytes we have
++    // requested is >= the number of bytes left to download. In other words,
++    // everything we still want has already been asked of somebody.
++    //
++    // N.B. `active_req_count()` is O(1), so this is O(peers).
++    auto const op = [](uint64_t acc, auto const& peer)
++    {
++        return acc + peer->active_req_count(TR_CLIENT_TO_PEER);
++    };
++    auto const n_active = std::accumulate(std::begin(swarm_.peers), std::end(swarm_.peers), uint64_t{}, op) +
++        std::accumulate(std::begin(swarm_.webseeds), std::end(swarm_.webseeds), uint64_t{}, op);
++    return n_active * tr_block_info::BlockSize >= tor_.left_until_done();
++}
++
+ bool tr_swarm::WishlistMediator::is_sequential_download() const
+ {
+     return tor_.is_sequential_download();
+@@ -1319,7 +1336,10 @@ std::vector<tr_block_span_t> tr_peerMgrGetNextRequests(tr_torrent* torrent, tr_p
+     {
+         return {};
+     }
+-    return swarm.wishlist->next(numwant, [peer](tr_piece_index_t p) { return peer->has_piece(p); });
++    return swarm.wishlist->next(
++        numwant,
++        [peer](tr_piece_index_t p) { return peer->has_piece(p); },
++        [peer](tr_block_index_t b) { return peer->active_requests.test(b); });
+ }
+ 
+ namespace
+diff --git a/tests/libtransmission/peer-mgr-wishlist-test.cc b/tests/libtransmission/peer-mgr-wishlist-test.cc
+index 8954ad690..875e2bb98 100644
+--- a/tests/libtransmission/peer-mgr-wishlist-test.cc
++++ b/tests/libtransmission/peer-mgr-wishlist-test.cc
+@@ -30,6 +30,7 @@ protected:
+         mutable std::set<tr_block_index_t> client_has_block_;
+         mutable std::set<tr_piece_index_t> client_has_piece_;
+         mutable std::set<tr_piece_index_t> client_wants_piece_;
++        bool is_endgame_ = false;
+         bool is_sequential_download_ = false;
+         tr_piece_index_t sequential_download_from_piece_ = 0;
+ 
+@@ -55,6 +56,11 @@ protected:
+             return client_wants_piece_.count(piece) != 0;
+         }
+ 
++        [[nodiscard]] bool is_endgame() const override
++        {
++            return is_endgame_;
++        }
++
+         [[nodiscard]] bool is_sequential_download() const override
+         {
+             return is_sequential_download_;
+@@ -333,6 +339,62 @@ TEST_F(PeerMgrWishlistTest, doesNotRequestSameBlockTwice)
+     EXPECT_EQ(240U, requested.count(10, 250));
+ }
+ 
++TEST_F(PeerMgrWishlistTest, endgameRequestsInFlightBlocksFromASecondPeer)
++{
++    auto mediator = MockMediator{ *this };
++
++    // setup: one piece of 10 blocks, all missing
++    mediator.block_span_[0] = { 0, 10 };
++    mediator.piece_replication_[0] = 2;
++    mediator.client_wants_piece_.insert(0);
++
++    // allow the wishlist to build its cache
++    auto wishlist = Wishlist{ mediator };
++
++    // a first peer has already been given every block
++    sent_request_.emit(nullptr, nullptr, { 0, 10 });
++
++    // outside of endgame a second peer gets nothing, which is what lets a
++    // single slow peer stall the tail of a download
++    EXPECT_TRUE(std::empty(wishlist.next(10, PeerHasAllPieces)));
++
++    // in endgame it should be offered the in-flight blocks instead
++    mediator.is_endgame_ = true;
++    auto spans = wishlist.next(10, PeerHasAllPieces);
++    auto requested = tr_bitfield{ 10 };
++    for (auto const& [begin, end] : spans)
++    {
++        requested.set_span(begin, end);
++    }
++    EXPECT_EQ(10U, requested.count());
++
++    // ...but not the blocks it is already downloading itself
++    static auto constexpr PeerIsDownloadingFirstHalf = [](tr_block_index_t b)
++    {
++        return b < 5U;
++    };
++    spans = wishlist.next(10, PeerHasAllPieces, PeerIsDownloadingFirstHalf);
++    requested = tr_bitfield{ 10 };
++    for (auto const& [begin, end] : spans)
++    {
++        requested.set_span(begin, end);
++    }
++    EXPECT_EQ(5U, requested.count());
++    EXPECT_EQ(0U, requested.count(0, 5));
++    EXPECT_EQ(5U, requested.count(5, 10));
++
++    // and never blocks we already have
++    mediator.client_has_block_.insert(9);
++    spans = wishlist.next(10, PeerHasAllPieces);
++    requested = tr_bitfield{ 10 };
++    for (auto const& [begin, end] : spans)
++    {
++        requested.set_span(begin, end);
++    }
++    EXPECT_EQ(9U, requested.count());
++    EXPECT_EQ(0U, requested.count(9, 10));
++}
++
+ TEST_F(PeerMgrWishlistTest, sequentialDownload)
+ {
+     auto const get_spans = [this](size_t n_wanted)

@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elouan Martinet <exa@elou.world>
+Date: Sun, 26 Jul 2026 17:43:09 +0000
+Subject: [PATCH] refactor: send block requests asap
+
+Partial backport of upstream 'refactor: send block requests asap' (#7026,
+commit fa832041c, in main but not in 4.1.x).
+
+Ask for new blocks as soon as something changes that could let us -- an
+Unchoke, a Have/Bitfield/HaveAll, becoming interested, or piece data
+arriving -- instead of waiting for the next 500ms bandwidth pulse.
+
+Most importantly, on a FextReject we now top up our requests *before*
+returning the rejected block to the wishlist, so that the peer that just
+refused the block does not immediately grab it again. Peers that
+persistently reject a block we already announced a HAVE for used to keep
+Transmission looping on them for a very long time (transmission#7919).
+
+The can_read() restructuring from #7026 is deliberately left out: 4.1.x
+keeps the peer alive there with shared_from_this() (#8921) and the two
+changes conflict.
+
+maybe_send_block_requests() is now reachable from message handlers, so its
+interested/unchoked preconditions become checks rather than asserts.
+---
+ libtransmission/peer-msgs.cc | 41 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/libtransmission/peer-msgs.cc b/libtransmission/peer-msgs.cc
+index 235bb8cfa..cd58e14c8 100644
+--- a/libtransmission/peer-msgs.cc
++++ b/libtransmission/peer-msgs.cc
+@@ -459,6 +459,10 @@ public:
+             set_client_interested(interested);
+             protocol_send_interest(interested);
+             update_active(TR_PEER_TO_CLIENT);
++
++            // make sure this is after we send the "interested" msg
++            update_desired_request_count();
++            maybe_send_block_requests();
+         }
+     }
+ 
+@@ -1463,6 +1467,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
+         }
+ 
+         update_active(TR_PEER_TO_CLIENT);
++        update_desired_request_count(); // set desired request count to 0
+         break;
+ 
+     case BtPeerMsgs::Unchoke:
+@@ -1470,6 +1475,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
+         set_client_choked(false);
+         update_active(TR_PEER_TO_CLIENT);
+         update_desired_request_count();
++        maybe_send_block_requests();
+         break;
+ 
+     case BtPeerMsgs::Interested:
+@@ -1500,6 +1506,10 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
+             have_.set(ui32);
+             peer_info->set_seed(is_seed());
+             publish(tr_peer_event::GotHave(ui32));
++
++            // make sure this is after publishing the event, so that the wishlist
++            // will have the latest info when choosing blocks to request
++            maybe_send_block_requests();
+         }
+ 
+         break;
+@@ -1510,6 +1520,11 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
+         have_.set_raw(reinterpret_cast<uint8_t const*>(std::data(payload)), std::size(payload));
+         peer_info->set_seed(is_seed());
+         publish(tr_peer_event::GotBitfield(&have_));
++
++        // make sure these are after publishing the event, so that the wishlist
++        // will have the latest info when choosing blocks to request
++        update_desired_request_count();
++        maybe_send_block_requests();
+         break;
+ 
+     case BtPeerMsgs::Request:
+@@ -1610,6 +1625,11 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
+             have_.set_has_all();
+             peer_info->set_seed();
+             publish(tr_peer_event::GotHaveAll());
++
++            // make sure these are after publishing the event, so that the wishlist
++            // will have the latest info when choosing blocks to request
++            update_desired_request_count();
++            maybe_send_block_requests();
+         }
+         else
+         {
+@@ -1648,6 +1668,12 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
+                 if (auto const block = tor_.piece_loc(r.index, r.offset).block; active_requests.test(block))
+                 {
+                     active_requests.unset(block);
++
++                    // Make sure maybe_send_block_requests() is called before returning the
++                    // block to the wishlist, so that it will choose a block other than the
++                    // rejected one.
++                    maybe_send_block_requests();
++
+                     publish(tr_peer_event::GotRejected(tor_.block_info(), block));
+                 }
+             }
+@@ -1860,6 +1886,14 @@ ReadState tr_peerMsgsImpl::can_read(tr_peerIo* io, void* vmsgs, size_t* piece)
+     current_message_type.reset();
+     current_payload.clear();
+ 
++    // If we received piece data then we may have freed up quota for new
++    // requests. Ask for them now instead of waiting for the next pulse.
++    if (n_piece_bytes_read > 0U && read_state != ReadState::Err)
++    {
++        msgs->update_desired_request_count();
++        msgs->maybe_send_block_requests();
++    }
++
+     return read_state;
+ }
+ 
+@@ -1901,7 +1935,9 @@ void tr_peerMsgsImpl::maybe_send_metadata_requests(time_t now) const
+ 
+ void tr_peerMsgsImpl::maybe_send_block_requests()
+ {
+-    if (!tor_.client_can_download())
++    // N.B. this is now called from message handlers as well as from pulse(),
++    // so the interested/choked preconditions are checks rather than asserts.
++    if (!tor_.client_can_download() || !client_is_interested() || client_is_choked())
+     {
+         return;
+     }
+@@ -1912,9 +1948,6 @@ void tr_peerMsgsImpl::maybe_send_block_requests()
+         return;
+     }
+ 
+-    TR_ASSERT(client_is_interested());
+-    TR_ASSERT(!client_is_choked());
+-
+     auto const n_wanted = desired_request_count_ - n_active;
+     if (auto const requests = tr_peerMgrGetNextRequests(&tor_, this, n_wanted); !std::empty(requests))
+     {

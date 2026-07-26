@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elouan Martinet <exa@elou.world>
+Date: Sun, 26 Jul 2026 17:44:45 +0000
+Subject: [PATCH] fix: don't immediately re-ask a peer for a block it just
+ rejected
+
+The wishlist is swarm-wide and has no memory of which peer failed which
+block: a rejected block goes straight back into the global pool and the
+peer that just refused it can pick it up again on the next pulse.
+
+transmission#7919 documents exactly this: a peer kept rejecting blocks in
+a piece Transmission had already announced a HAVE for (the piece was later
+invalidated by a failed checksum test), and Transmission kept asking that
+same peer for half an hour.
+
+Remember rejected blocks per peer for 60s and filter them out of what the
+wishlist hands us. The blocks stay 'unrequested' in the wishlist because we
+never publish a SentRequest event for them, so another peer picks them up.
+---
+ libtransmission/peer-msgs.cc | 113 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 112 insertions(+), 1 deletion(-)
+
+diff --git a/libtransmission/peer-msgs.cc b/libtransmission/peer-msgs.cc
+index cd58e14c8..ee434c751 100644
+--- a/libtransmission/peer-msgs.cc
++++ b/libtransmission/peer-msgs.cc
+@@ -591,6 +591,93 @@ private:
+ 
+     void check_request_timeout(time_t now);
+ 
++    // ---
++
++    // The wishlist is swarm-wide and has no memory of which peer failed which
++    // block, so without this we happily hand a rejected block straight back to
++    // the peer that just refused it, over and over. See transmission#7919,
++    // where a peer kept rejecting blocks in a piece we had announced a HAVE
++    // for (the piece was later invalidated by a failed checksum test).
++    void penalise_block(tr_block_index_t const block)
++    {
++        auto const expiry = tr_time() + BlockPenaltySecs;
++        for (auto& [penalised_block, penalised_until] : penalised_blocks_)
++        {
++            if (penalised_block == block)
++            {
++                penalised_until = expiry;
++                return;
++            }
++        }
++
++        // keep the list bounded: a peer that rejects everything shouldn't be
++        // able to make the lookups below expensive
++        if (std::size(penalised_blocks_) >= MaxPenalisedBlocks)
++        {
++            prune_penalised_blocks(tr_time());
++        }
++
++        if (std::size(penalised_blocks_) >= MaxPenalisedBlocks)
++        {
++            penalised_blocks_.erase(std::begin(penalised_blocks_));
++        }
++
++        penalised_blocks_.emplace_back(block, expiry);
++    }
++
++    [[nodiscard]] bool is_block_penalised(tr_block_index_t const block, time_t const now) const
++    {
++        return std::any_of(
++            std::begin(penalised_blocks_),
++            std::end(penalised_blocks_),
++            [block, now](auto const& pair) { return pair.first == block && pair.second > now; });
++    }
++
++    void prune_penalised_blocks(time_t const now)
++    {
++        penalised_blocks_.erase(
++            std::remove_if(
++                std::begin(penalised_blocks_),
++                std::end(penalised_blocks_),
++                [now](auto const& pair) { return pair.second <= now; }),
++            std::end(penalised_blocks_));
++    }
++
++    // Splits `spans` around the blocks this peer is currently penalised for.
++    [[nodiscard]] std::vector<tr_block_span_t> drop_penalised_blocks(std::vector<tr_block_span_t> const& spans) const
++    {
++        auto const now = tr_time();
++
++        auto ret = std::vector<tr_block_span_t>{};
++        ret.reserve(std::size(spans));
++
++        for (auto const& [begin, end] : spans)
++        {
++            auto span_begin = begin;
++            for (auto block = begin; block < end; ++block)
++            {
++                if (!is_block_penalised(block, now))
++                {
++                    continue;
++                }
++
++                if (span_begin < block)
++                {
++                    ret.push_back({ span_begin, block });
++                }
++
++                span_begin = block + 1U;
++            }
++
++            if (span_begin < end)
++            {
++                ret.push_back({ span_begin, end });
++            }
++        }
++
++        return ret;
++    }
++
+     [[nodiscard]] constexpr auto client_reqq() const noexcept
+     {
+         return session->reqq();
+@@ -739,6 +826,9 @@ private:
+ 
+     std::vector<std::pair<tr_block_index_t, time_t>> request_timeouts_;
+ 
++    // blocks this peer refused recently, and when the penalty expires
++    std::vector<std::pair<tr_block_index_t, time_t>> penalised_blocks_;
++
+     tr_incoming incoming_ = {};
+ 
+     // if the peer supports the Extension Protocol in BEP 10 and
+@@ -757,6 +847,12 @@ private:
+ 
+     // how many seconds we expect the next piece block to arrive
+     static auto constexpr RequestTimeoutSecs = time_t{ 25 };
++
++    // how long we avoid re-requesting a block that this peer rejected
++    static auto constexpr BlockPenaltySecs = time_t{ 60 };
++
++    // upper bound on how many rejected blocks we remember per peer
++    static auto constexpr MaxPenalisedBlocks = size_t{ 256 };
+ };
+ 
+ // ---
+@@ -1669,6 +1765,9 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
+                 {
+                     active_requests.unset(block);
+ 
++                    // don't pester this peer about this block again for a while
++                    penalise_block(block);
++
+                     // Make sure maybe_send_block_requests() is called before returning the
+                     // block to the wishlist, so that it will choose a block other than the
+                     // rejected one.
+@@ -1910,6 +2009,7 @@ void tr_peerMsgsImpl::pulse()
+     auto const now_msec = tr_time_msec();
+ 
+     check_request_timeout(now_sec);
++    prune_penalised_blocks(now_sec);
+     update_desired_request_count();
+     maybe_send_block_requests();
+     maybe_send_metadata_requests(now_sec);
+@@ -1949,7 +2049,18 @@ void tr_peerMsgsImpl::maybe_send_block_requests()
+     }
+ 
+     auto const n_wanted = desired_request_count_ - n_active;
+-    if (auto const requests = tr_peerMgrGetNextRequests(&tor_, this, n_wanted); !std::empty(requests))
++    auto requests = tr_peerMgrGetNextRequests(&tor_, this, n_wanted);
++
++    // The wishlist doesn't know that this peer refused some of these blocks
++    // already; drop them so we ask somebody else instead. The blocks stay
++    // unrequested in the wishlist because we never publish a SentRequest
++    // event for them.
++    if (!std::empty(penalised_blocks_))
++    {
++        requests = drop_penalised_blocks(requests);
++    }
++
++    if (!std::empty(requests))
+     {
+         request_blocks(std::data(requests), std::size(requests));
+     }

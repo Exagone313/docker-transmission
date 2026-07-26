@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Elouan Martinet <exa@elou.world>
+Date: Sun, 26 Jul 2026 17:45:36 +0000
+Subject: [PATCH] fix: guard requested_block_span() against an empty
+ unrequested set
+
+Wishlist::Impl::requested_block_span() dereferences begin() and prev(end())
+of the candidate's `unrequested` set to work out the erase range. Before
+endgame was restored this was safe, because next() only ever handed out
+blocks that were in that set.
+
+Endgame deliberately re-requests blocks that are already in flight, so a
+candidate with an empty `unrequested` can now reach this code.
+---
+ libtransmission/peer-mgr-wishlist.cc          | 19 ++++++----
+ .../libtransmission/peer-mgr-wishlist-test.cc | 37 +++++++++++++++++++
+ 2 files changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/libtransmission/peer-mgr-wishlist.cc b/libtransmission/peer-mgr-wishlist.cc
+index dc22482ef..0c18512be 100644
+--- a/libtransmission/peer-mgr-wishlist.cc
++++ b/libtransmission/peer-mgr-wishlist.cc
+@@ -194,15 +194,20 @@ private:
+                 break;
+             }
+ 
+-            auto& unreq = it_p->unrequested;
+-
+-            auto it_b_end = std::end(unreq);
+-            it_b_end = *std::prev(it_b_end) >= block_span.begin ? it_b_end : unreq.upper_bound(block_span.begin);
++            // N.B. an empty `unrequested` is reachable during endgame, when we
++            // deliberately re-request blocks that are already in flight. The
++            // bounds arithmetic below dereferences begin()/prev(end()), so it
++            // must not run on an empty set.
++            if (auto& unreq = it_p->unrequested; !std::empty(unreq))
++            {
++                auto it_b_end = std::end(unreq);
++                it_b_end = *std::prev(it_b_end) >= block_span.begin ? it_b_end : unreq.upper_bound(block_span.begin);
+ 
+-            auto it_b_begin = std::begin(unreq);
+-            it_b_begin = *it_b_begin < block_span.end ? it_b_begin : unreq.upper_bound(block_span.end);
++                auto it_b_begin = std::begin(unreq);
++                it_b_begin = *it_b_begin < block_span.end ? it_b_begin : unreq.upper_bound(block_span.end);
+ 
+-            unreq.erase(it_b_begin, it_b_end);
++                unreq.erase(it_b_begin, it_b_end);
++            }
+ 
+             block = it_p->block_span.end;
+ 
+diff --git a/tests/libtransmission/peer-mgr-wishlist-test.cc b/tests/libtransmission/peer-mgr-wishlist-test.cc
+index 875e2bb98..e53bedc91 100644
+--- a/tests/libtransmission/peer-mgr-wishlist-test.cc
++++ b/tests/libtransmission/peer-mgr-wishlist-test.cc
+@@ -395,6 +395,43 @@ TEST_F(PeerMgrWishlistTest, endgameRequestsInFlightBlocksFromASecondPeer)
+     EXPECT_EQ(0U, requested.count(9, 10));
+ }
+ 
++TEST_F(PeerMgrWishlistTest, endgameHandlesRequestOfAlreadyRequestedBlocks)
++{
++    auto mediator = MockMediator{ *this };
++
++    // setup: two pieces of 10 blocks, all missing
++    mediator.block_span_[0] = { 0, 10 };
++    mediator.block_span_[1] = { 10, 20 };
++    mediator.piece_replication_[0] = 2;
++    mediator.piece_replication_[1] = 2;
++    mediator.client_wants_piece_.insert(0);
++    mediator.client_wants_piece_.insert(1);
++    mediator.is_endgame_ = true;
++
++    // allow the wishlist to build its cache
++    auto wishlist = Wishlist{ mediator };
++
++    // a first peer has been given every block, so both candidates now have
++    // an empty `unrequested` set
++    sent_request_.emit(nullptr, nullptr, { 0, 20 });
++
++    // a second peer gets the same blocks in endgame...
++    auto const spans = wishlist.next(20, PeerHasAllPieces);
++    auto requested = tr_bitfield{ 20 };
++    for (auto const& [begin, end] : spans)
++    {
++        requested.set_span(begin, end);
++    }
++    EXPECT_EQ(20U, requested.count());
++
++    // ...and telling the wishlist about it must not walk off the end of the
++    // now-empty `unrequested` sets
++    for (auto const& span : spans)
++    {
++        sent_request_.emit(nullptr, nullptr, span);
++    }
++}
++
+ TEST_F(PeerMgrWishlistTest, sequentialDownload)
+ {
+     auto const get_spans = [this](size_t n_wanted)
