@@ -2,11 +2,90 @@
 
 FROM ghcr.io/linuxserver/unrar:latest AS unrar
 
+# ############################################################################
+# TEMPORARY: build patched transmission binaries.
+#
+# Upstream 4.1.x stalls at 99.9x% because the wishlist hands each block to a
+# single peer and never re-offers it: endgame was removed in 4.1.0. See
+# transmission/transmission#8935, #7919, #7834 and ./patches/.
+#
+# This stage builds the same transmission version the apk packages below
+# install, plus the patches, and only the binaries in /usr/bin are replaced.
+# The web assets, runtime libs, s6 services and everything else still come
+# from the distro packages, and nothing about /config or the on-disk state
+# changes -- so switching back to a stock linuxserver image later is just a
+# matter of pulling it.
+#
+# To go back to stock: delete this stage, the `COPY --from=transmission-builder`
+# line, the version guard at the bottom, and ./patches/.
+# ############################################################################
+FROM ghcr.io/linuxserver/baseimage-alpine:edge AS transmission-builder
+
+ARG TRANSMISSION_SRC_VERSION=4.1.3
+
+COPY patches/ /patches/
+
+RUN \
+  echo "**** install build deps ****" && \
+  apk add --no-cache \
+    build-base \
+    cmake \
+    curl-dev \
+    libevent-dev \
+    libpsl-dev \
+    linux-headers \
+    openssl-dev \
+    patch \
+    pkgconf \
+    zlib-dev && \
+  echo "**** fetch transmission ${TRANSMISSION_SRC_VERSION} ****" && \
+  mkdir -p /src && \
+  curl -fsSL -o /tmp/transmission.tar.xz \
+    "https://github.com/transmission/transmission/releases/download/${TRANSMISSION_SRC_VERSION}/transmission-${TRANSMISSION_SRC_VERSION}.tar.xz" && \
+  tar -xJf /tmp/transmission.tar.xz -C /src --strip-components=1 && \
+  echo "**** apply patches ****" && \
+  cd /src && \
+  for p in /patches/*.patch; do \
+    echo "applying $(basename "${p}")" && \
+    patch -p1 --batch --forward < "${p}"; \
+  done && \
+  echo "**** build ****" && \
+  cmake -S /src -B /build \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DENABLE_CLI=ON \
+    -DENABLE_DAEMON=ON \
+    -DENABLE_UTILS=ON \
+    -DENABLE_GTK=OFF \
+    -DENABLE_QT=OFF \
+    -DENABLE_MAC=OFF \
+    -DENABLE_TESTS=OFF \
+    -DENABLE_NLS=OFF \
+    -DENABLE_WERROR=OFF \
+    -DINSTALL_DOC=OFF \
+    -DINSTALL_WEB=OFF \
+    -DREBUILD_WEB=OFF \
+    -DRUN_CLANG_TIDY=OFF && \
+  cmake --build /build --parallel "$(nproc)" && \
+  echo "**** stage binaries ****" && \
+  mkdir -p /out/usr/bin && \
+  for b in transmission-daemon transmission-remote transmission-cli \
+           transmission-create transmission-edit transmission-show; do \
+    cp "$(find /build -type f -name "${b}" -perm -u+x | head -n1)" /out/usr/bin/; \
+  done && \
+  echo "**** keep symbols for the daemon, strip the rest ****" && \
+  for b in transmission-remote transmission-cli \
+           transmission-create transmission-edit transmission-show; do \
+    strip "/out/usr/bin/${b}"; \
+  done && \
+  /out/usr/bin/transmission-daemon --version
+
 FROM ghcr.io/linuxserver/baseimage-alpine:edge
 
 ARG BUILD_DATE
 ARG VERSION
 ARG TRANSMISSION_VERSION
+ARG TRANSMISSION_SRC_VERSION=4.1.3
 LABEL build_version="Linuxserver.io version:- ${VERSION} Build-date:- ${BUILD_DATE}"
 LABEL maintainer="aptalca"
 
@@ -37,6 +116,24 @@ COPY root/ /
 
 # add unrar
 COPY --from=unrar /usr/bin/unrar-alpine /usr/bin/unrar
+
+# TEMPORARY: overwrite the distro binaries with the patched ones.
+COPY --from=transmission-builder /out/usr/bin/ /usr/bin/
+
+# TEMPORARY: fail loudly if the distro moved on and the patched binaries no
+# longer match the rest of the package (web assets, docs, ...).
+RUN \
+  apk_ver="$(apk info -v | grep -m1 '^transmission-daemon-' | sed 's/^transmission-daemon-//')" && \
+  case "${apk_ver}" in \
+    "${TRANSMISSION_SRC_VERSION}"-*) \
+      echo "**** patched binaries match distro transmission ${apk_ver} ****" ;; \
+    *) \
+      echo "ERROR: distro transmission is '${apk_ver}' but the patched binaries are" >&2 && \
+      echo "       '${TRANSMISSION_SRC_VERSION}'. Either bump TRANSMISSION_SRC_VERSION and" >&2 && \
+      echo "       refresh ./patches, pass --build-arg TRANSMISSION_VERSION=${TRANSMISSION_SRC_VERSION}-r0," >&2 && \
+      echo "       or drop the patch stage and go back to the stock image." >&2 && \
+      exit 1 ;; \
+  esac
 
 # ports and volumes
 EXPOSE 9091 51413/tcp 51413/udp
