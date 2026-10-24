@@ -21,7 +21,7 @@ FROM ghcr.io/linuxserver/unrar:latest AS unrar
 # ############################################################################
 FROM ghcr.io/linuxserver/baseimage-alpine:edge AS transmission-builder
 
-ARG TRANSMISSION_SRC_VERSION=4.1.3
+ARG TRANSMISSION_SRC_VERSION=4.1.4
 
 COPY patches/ /patches/
 
@@ -85,7 +85,7 @@ FROM ghcr.io/linuxserver/baseimage-alpine:edge
 ARG BUILD_DATE
 ARG VERSION
 ARG TRANSMISSION_VERSION
-ARG TRANSMISSION_SRC_VERSION=4.1.3
+ARG TRANSMISSION_SRC_VERSION=4.1.4
 LABEL build_version="Linuxserver.io version:- ${VERSION} Build-date:- ${BUILD_DATE}"
 LABEL maintainer="aptalca"
 

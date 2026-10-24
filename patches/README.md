@@ -1,6 +1,6 @@
 # Local transmission patches
 
-Temporary local build of transmission `4.1.3` with fixes for the
+Temporary local build of transmission `4.1.4` with fixes for the
 "torrent stalls at 99.9x%" regression.
 
 Upstream issues: [#8935](https://github.com/transmission/transmission/issues/8935),
@@ -18,7 +18,7 @@ idle, which is why the torrent sits at 99.9x% with 0 B/s for minutes to hours
 and why "pause/resume" or "verify local data" unsticks it (both rebuild the
 wishlist).
 
-4.1.3 already has every wishlist fix that upstream has published; the remaining
+4.1.4 already has every wishlist fix that upstream has published; the remaining
 cause is still open upstream.
 
 ## Patches
@@ -30,9 +30,9 @@ cause is still open upstream.
 | `0003` | Remember per-peer which blocks a peer rejected, for 60s, so we stop looping on peers that refuse a block. |
 | `0004` | Guard `requested_block_span()` against an empty `unrequested` set, which `0001` makes reachable. |
 
-Generated with `git format-patch` from a branch based on the `4.1.3` tag; they
+Generated with `git format-patch` from a branch based on the `4.1.4` tag; they
 apply with `patch -p1` to the contents of the official
-`transmission-4.1.3.tar.xz` release tarball.
+`transmission-4.1.4.tar.xz` release tarball.
 
 ## Impact on state
 
