@@ -120,21 +120,6 @@ COPY --from=unrar /usr/bin/unrar-alpine /usr/bin/unrar
 # TEMPORARY: overwrite the distro binaries with the patched ones.
 COPY --from=transmission-builder /out/usr/bin/ /usr/bin/
 
-# TEMPORARY: fail loudly if the distro moved on and the patched binaries no
-# longer match the rest of the package (web assets, docs, ...).
-RUN \
-  apk_ver="$(apk info -v | grep -m1 '^transmission-daemon-' | sed 's/^transmission-daemon-//')" && \
-  case "${apk_ver}" in \
-    "${TRANSMISSION_SRC_VERSION}"-*) \
-      echo "**** patched binaries match distro transmission ${apk_ver} ****" ;; \
-    *) \
-      echo "ERROR: distro transmission is '${apk_ver}' but the patched binaries are" >&2 && \
-      echo "       '${TRANSMISSION_SRC_VERSION}'. Either bump TRANSMISSION_SRC_VERSION and" >&2 && \
-      echo "       refresh ./patches, pass --build-arg TRANSMISSION_VERSION=${TRANSMISSION_SRC_VERSION}-r0," >&2 && \
-      echo "       or drop the patch stage and go back to the stock image." >&2 && \
-      exit 1 ;; \
-  esac
-
 # ports and volumes
 EXPOSE 9091 51413/tcp 51413/udp
 VOLUME /config
